@@ -1,299 +1,403 @@
-import os
-import sys
-import time
-import logging
 import argparse
-import concurrent.futures
+import logging
 from pathlib import Path
 from typing import List, Optional
-from pdf2image import convert_from_path
-from docx import Document
-from bs4 import BeautifulSoup
-import requests
-from PIL import Image
-import imgkit
+from concurrent.futures import ThreadPoolExecutor
+import time
 from tqdm import tqdm
 
-from config import Config
+from document_analyzer import DocumentAnalyzer, DocumentInfo
+from image_processor import ImageProcessor
 from cache_manager import CacheManager
-from security import SecurityManager
+from security_manager import SecurityManager
 
 class DocumentConverter:
-    def __init__(self):
-        """אתחול ממיר המסמכים"""
-        # אתחול מנהלים
-        Config.init_directories()
-        self.cache = CacheManager()
-        self.security = SecurityManager()
+    """ממיר מסמכים חכם עם תכונות מתקדמות"""
+    
+    def __init__(self, 
+                 output_dir: str,
+                 cache_dir: str = None,
+                 security_dir: str = None,
+                 max_workers: int = None,
+                 batch_size: int = 10):
         
         # הגדרת לוגים
         self._setup_logging()
+        self.logger = logging.getLogger(__name__)
         
-        self.logger.info("מערכת המרת מסמכים אותחלה")
-
-    def _setup_logging(self):
-        """הגדרת מערכת הלוגים"""
-        self.logger = logging.getLogger('DocumentConverter')
-        self.logger.setLevel(Config.LOG_LEVEL)
+        # הגדרת נתיבים
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # הגדרת קובץ לוג מתגלגל
-        from logging.handlers import RotatingFileHandler
-        handler = RotatingFileHandler(
-            Config.LOG_DIR / 'converter.log',
-            maxBytes=Config.LOG_MAX_SIZE,
-            backupCount=Config.LOG_BACKUP_COUNT,
-            encoding='utf-8'
+        # אתחול רכיבים
+        self.document_analyzer = DocumentAnalyzer()
+        self.image_processor = ImageProcessor()
+        self.cache_manager = CacheManager(
+            cache_dir or str(Path.home() / '.document_converter' / 'cache')
         )
-        handler.setFormatter(logging.Formatter(Config.LOG_FORMAT))
-        self.logger.addHandler(handler)
+        self.security_manager = SecurityManager(
+            security_dir or str(Path.home() / '.document_converter' / 'security')
+        )
+        
+        # הגדרות עיבוד
+        self.max_workers = max_workers
+        self.batch_size = batch_size
+        
+        self.logger.info("מערכת המרת מסמכים אותחלה בהצלחה")
 
-    def process_pdf(self, file_path: str) -> List[Path]:
-        """המרת קובץ PDF לתמונות
+    def convert_files(self,
+                     file_paths: List[str],
+                     format: str = 'png',
+                     quality: int = 95,
+                     dpi: int = 300,
+                     optimize: bool = True,
+                     encrypt: bool = False,
+                     validate: bool = True) -> bool:
+        """המרת קבצים לתמונות
         
         Args:
-            file_path: נתיב לקובץ ה-PDF
+            file_paths: רשימת נתיבי קבצים
+            format: פורמט התמונות
+            quality: איכות התמונות (1-100)
+            dpi: רזולוציה
+            optimize: אופטימיזציה אוטומטית
+            encrypt: הצפנת הפלט
+            validate: אימות קבצים
             
         Returns:
-            רשימת נתיבים לתמונות שנוצרו
+            bool: האם ההמרה הצליחה
         """
-        self.logger.info(f"מתחיל המרת PDF: {file_path}")
-        output_files = []
-        
-        # בדיקת מטמון
-        cache_key = f"pdf_{file_path}"
-        cached_data = self.cache.get(cache_key)
-        if cached_data:
-            self.logger.info("נמצא במטמון")
-            return cached_data
-        
         try:
-            # המרה לתמונות
-            images = convert_from_path(file_path, dpi=Config.DEFAULT_DPI)
+            total_files = len(file_paths)
+            successful_files = 0
             
-            with tqdm(total=len(images), desc="ממיר עמודי PDF") as pbar:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-                    futures = []
-                    
-                    for i, image in enumerate(images, start=1):
-                        if i > Config.MAX_PAGES:
-                            break
-                            
-                        output_path = Config.OUTPUT_DIR / f"{i}.{Config.DEFAULT_IMAGE_FORMAT}"
-                        futures.append(
-                            executor.submit(self._save_image, image, output_path)
-                        )
+            self.logger.info(f"מתחיל המרה של {total_files} קבצים")
+            
+            # עיבוד הקבצים
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = []
+                
+                # הגשת משימות
+                for file_path in file_paths:
+                    if validate and not self.security_manager.validate_file(file_path):
+                        self.logger.warning(f"הקובץ {file_path} נכשל באימות")
+                        continue
                         
-                    for future in concurrent.futures.as_completed(futures):
-                        output_files.append(future.result())
-                        pbar.update(1)
+                    futures.append(
+                        executor.submit(
+                            self._convert_single_file,
+                            file_path,
+                            format,
+                            quality,
+                            dpi,
+                            optimize,
+                            encrypt
+                        )
+                    )
+                
+                # המתנה לתוצאות
+                for future in tqdm(futures, desc="מעבד קבצים"):
+                    if future.result():
+                        successful_files += 1
+            
+            success_rate = (successful_files / total_files) * 100
+            self.logger.info(f"הסתיימה המרה של {successful_files}/{total_files} קבצים ({success_rate:.1f}%)")
+            
+            return successful_files > 0
+            
+        except Exception as e:
+            self.logger.error(f"שגיאה בהמרת קבצים: {str(e)}")
+            return False
+
+    def _convert_single_file(self,
+                           file_path: str,
+                           format: str,
+                           quality: int,
+                           dpi: int,
+                           optimize: bool,
+                           encrypt: bool) -> bool:
+        """המרת קובץ בודד
+        
+        Args:
+            file_path: נתיב הקובץ
+            format: פורמט התמונות
+            quality: איכות התמונות
+            dpi: רזולוציה
+            optimize: אופטימיזציה אוטומטית
+            encrypt: הצפנת הפלט
+            
+        Returns:
+            bool: האם ההמרה הצליחה
+        """
+        try:
+            # ניתוח המסמך
+            doc_info = self.document_analyzer.analyze_document(file_path)
+            
+            # בדיקת מטמון
+            cache_key = f"{file_path}:{format}:{quality}:{dpi}:{optimize}"
+            cached_data = self.cache_manager.get(cache_key)
+            
+            if cached_data:
+                self.logger.info(f"נמצא במטמון: {file_path}")
+                return self._save_cached_images(cached_data, doc_info, encrypt)
+            
+            # המרה לתמונות
+            images = self._convert_to_images(doc_info)
+            if not images:
+                return False
+            
+            # עיבוד תמונות
+            processed_images = []
+            for img in images:
+                processed = self.image_processor.process_image(
+                    img,
+                    target_dpi=dpi,
+                    target_format=format,
+                    quality=quality,
+                    optimize=optimize
+                )
+                processed_images.append(processed)
+            
+            # שמירת תמונות
+            output_paths = self._save_images(
+                processed_images,
+                doc_info,
+                format,
+                quality,
+                encrypt
+            )
             
             # שמירה במטמון
-            self.cache.set(cache_key, output_files)
-            
-            self.logger.info(f"הומרו {len(output_files)} עמודי PDF")
-            return output_files
+            if output_paths:
+                self.cache_manager.set(cache_key, output_paths)
+                
+            return bool(output_paths)
             
         except Exception as e:
-            self.logger.error(f"שגיאה בהמרת PDF: {str(e)}")
-            raise
+            self.logger.error(f"שגיאה בהמרת הקובץ {file_path}: {str(e)}")
+            return False
 
-    def process_word(self, file_path: str) -> List[Path]:
-        """המרת מסמך Word לתמונות
+    def _convert_to_images(self, doc_info: DocumentInfo) -> List:
+        """המרת מסמך לתמונות
         
         Args:
-            file_path: נתיב לקובץ ה-Word
+            doc_info: מידע על המסמך
             
         Returns:
-            רשימת נתיבים לתמונות שנוצרו
+            List: רשימת תמונות
         """
-        self.logger.info(f"מתחיל המרת Word: {file_path}")
-        output_files = []
+        # TODO: לממש המרה ספציפית לכל סוג קובץ
+        pass
+
+    def _save_images(self,
+                    images: List,
+                    doc_info: DocumentInfo,
+                    format: str,
+                    quality: int,
+                    encrypt: bool) -> List[str]:
+        """שמירת תמונות
         
-        try:
-            doc = Document(file_path)
+        Args:
+            images: רשימת תמונות
+            doc_info: מידע על המסמך
+            format: פורמט התמונות
+            quality: איכות התמונות
+            encrypt: האם להצפין
             
-            with tqdm(total=len(doc.paragraphs), desc="ממיר עמודי Word") as pbar:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-                    futures = []
+        Returns:
+            List[str]: רשימת נתיבי הקבצים שנשמרו
+        """
+        try:
+            output_paths = []
+            
+            for i, image in enumerate(images, 1):
+                # יצירת שם קובץ
+                output_name = f"{Path(doc_info.file_path).stem}_{i:03d}.{format.lower()}"
+                output_path = self.output_dir / output_name
+                
+                # שמירת התמונה
+                image.save(
+                    output_path,
+                    format=format.upper(),
+                    quality=quality,
+                    optimize=True
+                )
+                
+                # הצפנה אם נדרש
+                if encrypt:
+                    with open(output_path, 'rb') as f:
+                        encrypted_data = self.security_manager.encrypt_data(f.read())
+                    with open(output_path, 'wb') as f:
+                        f.write(encrypted_data)
+                
+                output_paths.append(str(output_path))
+            
+            return output_paths
+            
+        except Exception as e:
+            self.logger.error(f"שגיאה בשמירת תמונות: {str(e)}")
+            return []
+
+    def _save_cached_images(self,
+                          cached_data: List[str],
+                          doc_info: DocumentInfo,
+                          encrypt: bool) -> bool:
+        """שמירת תמונות מהמטמון
+        
+        Args:
+            cached_data: נתיבי תמונות מהמטמון
+            doc_info: מידע על המסמך
+            encrypt: האם להצפין
+            
+        Returns:
+            bool: האם השמירה הצליחה
+        """
+        try:
+            for cache_path in cached_data:
+                # העתקת הקובץ מהמטמון
+                with open(cache_path, 'rb') as f:
+                    data = f.read()
                     
-                    for i, paragraph in enumerate(doc.paragraphs, start=1):
-                        if i > Config.MAX_PAGES:
-                            break
-                            
-                        if paragraph.text.strip():
-                            output_path = Config.OUTPUT_DIR / f"{i}.{Config.DEFAULT_IMAGE_FORMAT}"
-                            futures.append(
-                                executor.submit(
-                                    self._create_word_image,
-                                    paragraph.text,
-                                    output_path
-                                )
-                            )
-                            
-                    for future in concurrent.futures.as_completed(futures):
-                        output_files.append(future.result())
-                        pbar.update(1)
-            
-            self.logger.info(f"הומרו {len(output_files)} עמודי Word")
-            return output_files
+                # הצפנה אם נדרש
+                if encrypt:
+                    data = self.security_manager.encrypt_data(data)
+                    
+                # שמירה בתיקיית הפלט
+                output_path = self.output_dir / Path(cache_path).name
+                with open(output_path, 'wb') as f:
+                    f.write(data)
+                    
+            return True
             
         except Exception as e:
-            self.logger.error(f"שגיאה בהמרת Word: {str(e)}")
-            raise
+            self.logger.error(f"שגיאה בשמירת תמונות מהמטמון: {str(e)}")
+            return False
 
-    def process_html(self, source: str) -> List[Path]:
-        """המרת HTML או URL לתמונות
+    def _setup_logging(self):
+        """הגדרת לוגים"""
+        log_dir = Path('logs')
+        log_dir.mkdir(exist_ok=True)
         
-        Args:
-            source: נתיב לקובץ HTML או כתובת URL
-            
-        Returns:
-            רשימת נתיבים לתמונות שנוצרו
-        """
-        self.logger.info(f"מתחיל המרת HTML/URL: {source}")
-        
-        try:
-            # בדיקת אבטחה ל-URL
-            if source.startswith(('http://', 'https://')):
-                if not self.security.validate_url(source):
-                    raise ValueError("כתובת URL לא בטוחה")
-                response = requests.get(source)
-                html_content = response.text
-            else:
-                with open(source, 'r', encoding='utf-8') as f:
-                    html_content = f.read()
-
-            # הגדרות עבור imgkit
-            options = {
-                'format': Config.DEFAULT_IMAGE_FORMAT,
-                'encoding': 'UTF-8',
-                'quality': Config.IMAGE_FORMATS[Config.DEFAULT_IMAGE_FORMAT]['quality']
-            }
-
-            output_path = Config.OUTPUT_DIR / f"1.{Config.DEFAULT_IMAGE_FORMAT}"
-            imgkit.from_string(html_content, str(output_path), options=options)
-            
-            self.logger.info("הומר דף HTML/URL")
-            return [output_path]
-            
-        except Exception as e:
-            self.logger.error(f"שגיאה בהמרת HTML/URL: {str(e)}")
-            raise
-
-    def _save_image(self, image: Image.Image, output_path: Path) -> Path:
-        """שמירת תמונה בפורמט הרצוי
-        
-        Args:
-            image: אובייקט התמונה
-            output_path: נתיב השמירה
-            
-        Returns:
-            נתיב התמונה שנשמרה
-        """
-        image_format = Config.DEFAULT_IMAGE_FORMAT.upper()
-        quality = Config.IMAGE_FORMATS[Config.DEFAULT_IMAGE_FORMAT]['quality']
-        
-        image.save(
-            output_path,
-            format=image_format,
-            quality=quality,
-            optimize=True
+        # הגדרת פורמט
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-        return output_path
-
-    def _create_word_image(self, text: str, output_path: Path) -> Path:
-        """יצירת תמונה מטקסט של Word
         
-        Args:
-            text: הטקסט ליצירת התמונה
-            output_path: נתיב השמירה
-            
-        Returns:
-            נתיב התמונה שנוצרה
-        """
-        # יצירת תמונה עם הטקסט
-        image = Image.new('RGB', Config.DEFAULT_IMAGE_SIZE, 'white')
-        return self._save_image(image, output_path)
-
-    def convert(self, file_path: str) -> List[Path]:
-        """פונקציה ראשית להמרת מסמך
+        # לוג ראשי
+        main_handler = logging.FileHandler('logs/converter.log', encoding='utf-8')
+        main_handler.setFormatter(formatter)
         
-        Args:
-            file_path: נתיב לקובץ או URL
-            
-        Returns:
-            רשימת נתיבים לתמונות שנוצרו
-        """
-        try:
-            # ניקוי וולידציה של הקלט
-            file_path = self.security.sanitize_path(file_path)
-            
-            if not Config.validate_file(file_path) and not self.security.validate_url(file_path):
-                raise ValueError("סוג הקובץ אינו נתמך או שהקובץ אינו תקין")
-                
-            # בחירת המעבד המתאים
-            if file_path.lower().endswith('.pdf'):
-                return self.process_pdf(file_path)
-            elif file_path.lower().endswith('.docx'):
-                return self.process_word(file_path)
-            elif file_path.lower().endswith('.html') or file_path.startswith(('http://', 'https://')):
-                return self.process_html(file_path)
-            else:
-                raise ValueError("סוג הקובץ אינו נתמך")
-                
-        except Exception as e:
-            self.logger.error(f"שגיאה בהמרה: {str(e)}")
-            raise
+        # לוג שגיאות
+        error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
+        error_handler.setFormatter(formatter)
+        error_handler.setLevel(logging.ERROR)
+        
+        # הגדרת לוגר
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(main_handler)
+        root_logger.addHandler(error_handler)
 
 def main():
-    """פונקציית הפעלה ראשית"""
-    parser = argparse.ArgumentParser(description='המרת מסמכים לתמונות')
-    parser.add_argument('files', nargs='+', help='נתיבים לקבצים להמרה או כתובות URL')
-    parser.add_argument('--output-dir', help='תיקיית פלט (ברירת מחדל: תיקיית ברירת המחדל)', default=None)
-    parser.add_argument('--format', choices=['png', 'jpg', 'webp'], default='png', help='פורמט תמונות הפלט')
-    parser.add_argument('--dpi', type=int, default=300, help='רזולוציית התמונות')
-    parser.add_argument('--quality', type=int, default=95, help='איכות התמונות (1-100)')
+    """פונקציה ראשית"""
+    parser = argparse.ArgumentParser(description="ממיר מסמכים חכם לתמונות")
+    
+    # פרמטרים בסיסיים
+    parser.add_argument(
+        'files',
+        nargs='+',
+        help="נתיבי הקבצים להמרה"
+    )
+    
+    # פרמטרי תמונה
+    parser.add_argument(
+        '--format',
+        choices=['png', 'jpg', 'webp'],
+        default='png',
+        help="פורמט התמונות"
+    )
+    parser.add_argument(
+        '--quality',
+        type=int,
+        choices=range(1, 101),
+        default=95,
+        help="איכות התמונות (1-100)"
+    )
+    parser.add_argument(
+        '--dpi',
+        type=int,
+        default=300,
+        help="רזולוציית התמונות"
+    )
+    
+    # פרמטרי עיבוד
+    parser.add_argument(
+        '--optimize',
+        action='store_true',
+        help="אופטימיזציה אוטומטית"
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        help="מספר תהליכים במקביל"
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=10,
+        help="גודל אצווה לעיבוד"
+    )
+    
+    # פרמטרי אבטחה
+    parser.add_argument(
+        '--encrypt',
+        action='store_true',
+        help="הצפנת הפלט"
+    )
+    parser.add_argument(
+        '--validate',
+        action='store_true',
+        help="אימות קבצים"
+    )
+    
+    # פרמטרי מערכת
+    parser.add_argument(
+        '--output-dir',
+        default='output',
+        help="תיקיית פלט"
+    )
+    parser.add_argument(
+        '--cache-dir',
+        help="תיקיית מטמון"
+    )
+    parser.add_argument(
+        '--security-dir',
+        help="תיקיית אבטחה"
+    )
     
     args = parser.parse_args()
     
-    # עדכון הגדרות לפי הפרמטרים
-    if args.output_dir:
-        Config.OUTPUT_DIR = Path(args.output_dir)
-    Config.DEFAULT_IMAGE_FORMAT = args.format
-    Config.DEFAULT_DPI = args.dpi
-    Config.IMAGE_FORMATS[args.format]['quality'] = args.quality
+    # יצירת הממיר
+    converter = DocumentConverter(
+        output_dir=args.output_dir,
+        cache_dir=args.cache_dir,
+        security_dir=args.security_dir,
+        max_workers=args.workers,
+        batch_size=args.batch_size
+    )
     
-    try:
-        print("\nמערכת המרת מסמכים לתמונות")
-        print("=" * 50)
-        
-        converter = DocumentConverter()
-        total_files = 0
-        
-        for file_path in args.files:
-            print(f"\nמעבד קובץ: {file_path}")
-            start_time = time.time()
-            
-            try:
-                output_files = converter.convert(file_path)
-                total_files += len(output_files)
-                
-                print(f"✓ הושלם בהצלחה!")
-                print(f"  זמן עיבוד: {time.time() - start_time:.2f} שניות")
-                print(f"  מספר תמונות: {len(output_files)}")
-                
-            except Exception as e:
-                print(f"✗ שגיאה בעיבוד הקובץ: {str(e)}")
-                continue
-        
-        print("\nסיכום:")
-        print(f"סה\"כ קבצים שעובדו: {len(args.files)}")
-        print(f"סה\"כ תמונות שנוצרו: {total_files}")
-        print(f"התמונות נשמרו בתיקייה: {Config.OUTPUT_DIR}")
-        
-    except Exception as e:
-        print(f"\nשגיאה: {str(e)}")
-        sys.exit(1)
+    # המרת הקבצים
+    success = converter.convert_files(
+        args.files,
+        format=args.format,
+        quality=args.quality,
+        dpi=args.dpi,
+        optimize=args.optimize,
+        encrypt=args.encrypt,
+        validate=args.validate
+    )
+    
+    return 0 if success else 1
 
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    exit(main()) 
