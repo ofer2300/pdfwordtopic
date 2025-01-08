@@ -49,4 +49,4 @@ python document_converter.py --format jpg --quality 90 --dpi 300 "file.pdf"
 - Windows 10/11
 - Python 3.8 ומעלה
 
-כל שאר הדרישות יותקנו אוטומטית על ידי סקריפט ההתקנה. 
+כל שאר הדרישות יותקנו אוטומטית על ידי סקריפט ההתקנה.
