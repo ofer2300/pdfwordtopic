@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+import argparse
 import concurrent.futures
 from pathlib import Path
 from typing import List, Optional
@@ -246,26 +247,48 @@ class DocumentConverter:
 
 def main():
     """פונקציית הפעלה ראשית"""
+    parser = argparse.ArgumentParser(description='המרת מסמכים לתמונות')
+    parser.add_argument('files', nargs='+', help='נתיבים לקבצים להמרה או כתובות URL')
+    parser.add_argument('--output-dir', help='תיקיית פלט (ברירת מחדל: תיקיית ברירת המחדל)', default=None)
+    parser.add_argument('--format', choices=['png', 'jpg', 'webp'], default='png', help='פורמט תמונות הפלט')
+    parser.add_argument('--dpi', type=int, default=300, help='רזולוציית התמונות')
+    parser.add_argument('--quality', type=int, default=95, help='איכות התמונות (1-100)')
+    
+    args = parser.parse_args()
+    
+    # עדכון הגדרות לפי הפרמטרים
+    if args.output_dir:
+        Config.OUTPUT_DIR = Path(args.output_dir)
+    Config.DEFAULT_IMAGE_FORMAT = args.format
+    Config.DEFAULT_DPI = args.dpi
+    Config.IMAGE_FORMATS[args.format]['quality'] = args.quality
+    
     try:
-        print("ברוכים הבאים למערכת המרת מסמכים לתמונות!")
+        print("\nמערכת המרת מסמכים לתמונות")
         print("=" * 50)
-        print("\nתכונות עיקריות:")
-        print("- תמיכה בקבצי PDF, Word, HTML וכתובות URL")
-        print("- המרה מהירה עם עיבוד מקבילי")
-        print("- שמירת תמונות באיכות גבוהה")
-        print("- מטמון חכם לשיפור ביצועים")
-        print("- אבטחה מתקדמת")
-        print("\nאנא הזן את הנתיב לקובץ (PDF/Word/HTML) או כתובת URL:")
         
-        file_path = input().strip()
-        
-        start_time = time.time()
         converter = DocumentConverter()
-        output_files = converter.convert(file_path)
+        total_files = 0
         
-        print(f"\nההמרה הושלמה בהצלחה!")
-        print(f"זמן עיבוד: {time.time() - start_time:.2f} שניות")
-        print(f"מספר קבצים שנוצרו: {len(output_files)}")
+        for file_path in args.files:
+            print(f"\nמעבד קובץ: {file_path}")
+            start_time = time.time()
+            
+            try:
+                output_files = converter.convert(file_path)
+                total_files += len(output_files)
+                
+                print(f"✓ הושלם בהצלחה!")
+                print(f"  זמן עיבוד: {time.time() - start_time:.2f} שניות")
+                print(f"  מספר תמונות: {len(output_files)}")
+                
+            except Exception as e:
+                print(f"✗ שגיאה בעיבוד הקובץ: {str(e)}")
+                continue
+        
+        print("\nסיכום:")
+        print(f"סה\"כ קבצים שעובדו: {len(args.files)}")
+        print(f"סה\"כ תמונות שנוצרו: {total_files}")
         print(f"התמונות נשמרו בתיקייה: {Config.OUTPUT_DIR}")
         
     except Exception as e:

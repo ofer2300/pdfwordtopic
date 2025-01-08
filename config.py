@@ -4,7 +4,7 @@ import os
 class Config:
     # נתיבי מערכת
     BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-    OUTPUT_DIR = Path(r"C:\Users\user\OneDrive\Attachments\Desktop\אימון לרוסית\תפזורת")
+    OUTPUT_DIR = Path(r"C:\Users\user\Documents\pdf_output")
     TEMP_DIR = BASE_DIR / "temp"
     CACHE_DIR = BASE_DIR / "cache"
     LOG_DIR = BASE_DIR / "logs"
